@@ -1,5 +1,5 @@
 """
-🦚 Peacock Backtest V2 — R-Multiple Edge Validator
+🦚 Peacock Backtest V3 — R-Multiple Edge Validator
 ==================================================
 Backtest กลยุทธ์ Peacock เพื่อพิสูจน์ว่ามี Edge จริงหรือไม่
 
@@ -8,19 +8,19 @@ ENTRY:
 
 EXIT:
   - Initial SL (วัน entry):
-    * ถ้า (Close − EMA200)/EMA200 > 3% → SL = max(EMA10, entry × 0.97)
-    * ถ้า ≤ 3% → SL = max(EMA200, entry × 0.97)
-    * Master Law: SL ห่างจาก entry ไม่เกิน 3%
+    * ถ้า (Close − EMA200)/EMA200 > 3% → SL = EMA10
+    * ถ้า ≤ 3% → SL = EMA200
+    * Master Law (ขอบบน): SL ห่างจาก entry ไม่เกิน 3%
+    * Min Risk (ขอบล่าง): SL ห่างจาก entry ไม่ต่ำกว่า 1% ← V3 NEW
   - Trailing: ทุกวัน Stop = max(SL_initial, EMA20)
     EXIT เมื่อ Close < Stop → ขายที่ next Open
 
 R-Multiple = (exit − entry) / (entry − SL_initial)
 
-V2 Changes:
-  - ตัด Group A/B classification ออก (เร็วขึ้น)
-  - R-Distribution มี slider ปรับ X-axis range
-  - แสดงจำนวน trade ที่อยู่นอก range เป็น annotation
-  - เพิ่ม Median R, Percentiles, SL Type breakdown
+V3 Changes:
+  - เพิ่ม Min Risk floor (ป้องกัน R ระเบิดเมื่อ EMA candidate ใกล้ entry มาก)
+  - sl_type มี suffix +MinR เมื่อติด floor
+  - sidebar เพิ่ม Min Risk per Trade input
 
 วิธีรัน:
   pip install streamlit yfinance pandas plotly
@@ -100,7 +100,13 @@ with st.sidebar:
     master_law_pct = st.number_input(
         "Master Law: Max Risk per Trade (%)",
         min_value=1.0, max_value=10.0, value=3.0, step=0.5,
-        help="SL ห่างจาก entry ห้ามเกินค่านี้"
+        help="SL ห่างจาก entry ห้ามเกินค่านี้ (ขอบบน)"
+    )
+
+    min_risk_pct = st.number_input(
+        "🛡️ Min Risk per Trade (%)",
+        min_value=0.0, max_value=3.0, value=1.0, step=0.1,
+        help="SL ห่างจาก entry ขั้นต่ำ — ถ้า EMA candidate ใกล้กว่านี้จะถูกขยับออก ป้องกัน R ระเบิด (ขอบล่าง)"
     )
 
     st.divider()
@@ -154,8 +160,16 @@ def find_fresh_signals(df):
     return np.where(fresh.values)[0]
 
 
-def simulate_trade(df, signal_idx, threshold_pct, master_law_pct):
-    """จำลอง 1 trade ตาม Peacock rules"""
+def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1.0):
+    """
+    จำลอง 1 trade ตาม Peacock rules
+    
+    SL Logic:
+      1. คำนวณ candidate (EMA10 ถ้าลอยสูง, EMA200 ถ้าใกล้)
+      2. Apply Master Law cap (SL ห่าง entry ไม่เกิน max_risk_pct)
+      3. Apply Min Risk floor (SL ห่าง entry ไม่ต่ำกว่า min_risk_pct)
+         → ป้องกัน R ระเบิดจาก SL candidate ใกล้ entry มากเกินไป
+    """
     if signal_idx + 1 >= len(df):
         return None
 
@@ -177,10 +191,18 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct):
         sl_candidate = ema200
         sl_type = "EMA200"
 
-    sl_floor = entry_price * (1 - master_law_pct / 100)
-    sl_initial = max(sl_candidate, sl_floor)
-    if sl_initial == sl_floor and sl_floor > sl_candidate:
+    # Master Law: SL ต้องไม่ห่างเกิน max_risk_pct (ขอบบน)
+    sl_max_floor = entry_price * (1 - master_law_pct / 100)
+    sl_initial = max(sl_candidate, sl_max_floor)
+    if sl_initial == sl_max_floor and sl_max_floor > sl_candidate:
         sl_type = f"{sl_type}+ML"
+
+    # Min Risk: SL ต้องไม่ใกล้กว่า min_risk_pct (ขอบล่าง)
+    # ถ้า candidate ใกล้เกินไป → ขยับ SL ออกให้ห่างขึ้น
+    sl_min_ceiling = entry_price * (1 - min_risk_pct / 100)
+    if sl_initial > sl_min_ceiling:
+        sl_initial = sl_min_ceiling
+        sl_type = f"{sl_type}+MinR"
 
     if sl_initial >= entry_price:
         return None
@@ -234,7 +256,7 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct):
     }
 
 
-def backtest_symbol(symbol, period, threshold_pct, master_law_pct):
+def backtest_symbol(symbol, period, threshold_pct, master_law_pct, min_risk_pct=1.0):
     """Backtest หุ้น 1 ตัว → คืน list ของ trades"""
     try:
         df = yf.download(
@@ -256,7 +278,7 @@ def backtest_symbol(symbol, period, threshold_pct, master_law_pct):
             if idx < 200:
                 continue
 
-            trade = simulate_trade(df, idx, threshold_pct, master_law_pct)
+            trade = simulate_trade(df, idx, threshold_pct, master_law_pct, min_risk_pct)
             if trade is None:
                 continue
             trade["symbol"] = symbol
@@ -337,7 +359,8 @@ if run_btn:
         with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
             futures = {
                 ex.submit(backtest_symbol, sym, period,
-                          float(threshold_pct), float(master_law_pct)): sym
+                          float(threshold_pct), float(master_law_pct),
+                          float(min_risk_pct)): sym
                 for sym in symbols
             }
             done = 0
@@ -355,7 +378,8 @@ if run_btn:
             status.text(f"[{i+1}/{len(symbols)}] {sym}...")
             sym, trades, st_status = backtest_symbol(
                 sym, period,
-                float(threshold_pct), float(master_law_pct)
+                float(threshold_pct), float(master_law_pct),
+                float(min_risk_pct)
             )
             if st_status == "ok":
                 all_trades.extend(trades)
@@ -574,7 +598,8 @@ if df.empty:
     **Initial SL (วัน entry)**
     - ถ้า (Close − EMA200)/EMA200 > 3% → ใช้ EMA10 cut
     - ถ้า ≤ 3% → ใช้ EMA200 cut
-    - **Master Law**: SL ห่างจาก entry ห้ามเกิน 3%
+    - **Master Law (ขอบบน)**: SL ห่างจาก entry ห้ามเกิน 3%
+    - **Min Risk (ขอบล่าง)**: SL ห่างจาก entry ห้ามต่ำกว่า 1% (ป้องกัน R ระเบิด)
     
     **Trailing**
     - ทุกวัน: Stop = max(SL_initial, EMA20 ของวันนั้น)
@@ -610,26 +635,57 @@ else:
     st.divider()
     st.subheader("📈 R-Distribution")
 
-    r_floor = float(min(stats["min_R"] - 1, -3))
-    r_ceil = float(max(stats["max_R"] + 1, 10))
+    # ── Preset buttons (เลือกช่วงด่วน) ──
+    st.markdown("**🎯 ช่วงสำเร็จรูป:**")
+    preset_cols = st.columns(5)
+    presets = [
+        ("Zoom in (±3R)", -3.0, 3.0),
+        ("Normal (-5 ถึง +10)", -5.0, 10.0),
+        ("Wide (-10 ถึง +20)", -10.0, 20.0),
+        ("Full (Min-Max)", float(np.floor(stats["min_R"])), float(np.ceil(stats["max_R"]))),
+        ("Custom 👇", None, None),
+    ]
+    for i, (label, lo, hi) in enumerate(presets):
+        with preset_cols[i]:
+            if st.button(label, use_container_width=True, key=f"preset_{i}"):
+                if lo is not None:
+                    st.session_state["x_min_input"] = lo
+                    st.session_state["x_max_input"] = hi
 
-    col_l, col_r = st.columns([3, 1])
-    with col_l:
-        x_range = st.slider(
-            "ปรับช่วงแกน X (R-Multiple ที่จะแสดง)",
-            min_value=float(np.floor(r_floor)),
-            max_value=float(np.ceil(r_ceil)),
-            value=(-3.0, 10.0),
+    # ── Number inputs (กรอกเอง) ──
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+    with col_a:
+        x_min = st.number_input(
+            "R Min (ขอบซ้าย)",
+            value=st.session_state.get("x_min_input", -5.0),
             step=0.5,
-            help="ลาก slider เพื่อขยาย/ย่อช่วง — outlier นอกช่วงจะแสดงเป็น annotation",
+            format="%.1f",
+            key="x_min_input",
+            help="ค่า R ต่ำสุดที่จะแสดงในกราฟ",
         )
-    with col_r:
+    with col_b:
+        x_max = st.number_input(
+            "R Max (ขอบขวา)",
+            value=st.session_state.get("x_max_input", 10.0),
+            step=0.5,
+            format="%.1f",
+            key="x_max_input",
+            help="ค่า R สูงสุดที่จะแสดงในกราฟ",
+        )
+    with col_c:
         bin_size = st.selectbox(
             "ขนาด Bin",
             [0.25, 0.5, 1.0],
             index=1,
             help="bin เล็ก = ละเอียด, bin ใหญ่ = อ่านง่าย",
         )
+
+    # Validation: x_min < x_max
+    if x_min >= x_max:
+        st.warning("⚠️ R Min ต้องน้อยกว่า R Max — ใช้ค่า default −5 ถึง +10")
+        x_min, x_max = -5.0, 10.0
+
+    x_range = (x_min, x_max)
 
     st.plotly_chart(
         plot_r_distribution(df, x_range[0], x_range[1], bin_size),
@@ -659,7 +715,8 @@ else:
     st.dataframe(sl_show, use_container_width=True, hide_index=True)
     st.caption(
         "🟢 EMA10 = ลอยสูง > 3% | 🔵 EMA200 = ใกล้ EMA200 | "
-        "🟡 +ML = ติด Master Law cap"
+        "🟡 +ML = ติด Master Law cap (ขอบบน) | "
+        "🟠 +MinR = ติด Min Risk floor (ขอบล่าง)"
     )
 
     st.divider()
