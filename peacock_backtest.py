@@ -110,6 +110,29 @@ with st.sidebar:
     )
 
     st.divider()
+    st.header("🎯 Market Regime Filter")
+    use_regime = st.checkbox(
+        "เปิดใช้งาน Filter",
+        value=True,
+        help="เทรดเฉพาะตอน Benchmark > EMA200 (ตลาดขาขึ้น)"
+    )
+    benchmark_default = "SPY" if universe_choice == "S&P 500" else (
+        "^SET.BK" if universe_choice == "SET100" else "SPY"
+    )
+    benchmark_symbol = st.text_input(
+        "Benchmark Symbol",
+        value=benchmark_default,
+        disabled=not use_regime,
+        help="SPY = S&P 500 | ^SET.BK = SET Index | ^GSPC = S&P 500 raw"
+    )
+    regime_ema_period = st.number_input(
+        "Regime EMA Period",
+        min_value=50, max_value=300, value=200, step=10,
+        disabled=not use_regime,
+        help="200 = standard"
+    )
+
+    st.divider()
     use_concurrent = st.checkbox(
         "⚡ Concurrent fetch (เร็วขึ้น 5-10×)",
         value=True
@@ -128,6 +151,41 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════
 def calc_ema(s, p):
     return s.ewm(span=p, adjust=False).mean()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_benchmark(symbol, period, ema_period):
+    """โหลด benchmark + คำนวณ EMA + คืน DataFrame ที่ index ตรงกับ trading days"""
+    try:
+        df = yf.download(
+            symbol, period=period, interval="1d",
+            progress=False, auto_adjust=False, threads=False
+        )
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df["EMA"] = calc_ema(df["Close"], ema_period)
+        # Series boolean: True = bull regime
+        df["is_bull"] = df["Close"] > df["EMA"]
+        return df[["Close", "EMA", "is_bull"]]
+    except Exception:
+        return None
+
+
+def get_regime_at(benchmark_df, date):
+    """เช็ค regime ที่วันใดวันหนึ่ง — คืน 'bull' / 'bear' / 'unknown'"""
+    if benchmark_df is None:
+        return "unknown"
+    try:
+        # หา trading day ที่ใกล้ที่สุด (ก่อนหรือเท่ากับ date)
+        idx = benchmark_df.index.searchsorted(date, side="right") - 1
+        if idx < 0:
+            return "unknown"
+        is_bull = bool(benchmark_df["is_bull"].iloc[idx])
+        return "bull" if is_bull else "bear"
+    except Exception:
+        return "unknown"
 
 
 def add_emas(df):
@@ -256,8 +314,9 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
     }
 
 
-def backtest_symbol(symbol, period, threshold_pct, master_law_pct, min_risk_pct=1.0):
-    """Backtest หุ้น 1 ตัว → คืน list ของ trades"""
+def backtest_symbol(symbol, period, threshold_pct, master_law_pct,
+                    min_risk_pct=1.0, benchmark_df=None):
+    """Backtest หุ้น 1 ตัว → คืน list ของ trades พร้อม regime tag"""
     try:
         df = yf.download(
             symbol, period=period, interval="1d",
@@ -282,6 +341,9 @@ def backtest_symbol(symbol, period, threshold_pct, master_law_pct, min_risk_pct=
             if trade is None:
                 continue
             trade["symbol"] = symbol
+            # tag regime at signal day (วันก่อน entry)
+            signal_date = df.index[idx]
+            trade["regime"] = get_regime_at(benchmark_df, signal_date)
             trades.append(trade)
             last_exit_idx = trade["_exit_idx_in_df"]
 
@@ -347,6 +409,21 @@ if run_btn:
     if limit_n > 0:
         symbols = symbols[:int(limit_n)]
 
+    # ── โหลด Benchmark สำหรับ Regime Filter ──
+    benchmark_df = None
+    if use_regime:
+        with st.spinner(f"กำลังโหลด benchmark {benchmark_symbol}..."):
+            benchmark_df = load_benchmark(benchmark_symbol, period, int(regime_ema_period))
+        if benchmark_df is None or benchmark_df.empty:
+            st.warning(f"⚠️ โหลด {benchmark_symbol} ไม่สำเร็จ — รันโดยไม่ใช้ Regime Filter")
+            benchmark_df = None
+        else:
+            bull_pct = benchmark_df["is_bull"].mean() * 100
+            st.info(
+                f"📊 Benchmark **{benchmark_symbol}** โหลดสำเร็จ — "
+                f"ตลาดเป็น **bull {bull_pct:.1f}%** ของช่วงเวลา ({period})"
+            )
+
     st.info(f"กำลัง backtest {len(symbols)} ตัว... (period: {period})")
 
     progress = st.progress(0.0)
@@ -360,7 +437,7 @@ if run_btn:
             futures = {
                 ex.submit(backtest_symbol, sym, period,
                           float(threshold_pct), float(master_law_pct),
-                          float(min_risk_pct)): sym
+                          float(min_risk_pct), benchmark_df): sym
                 for sym in symbols
             }
             done = 0
@@ -379,7 +456,7 @@ if run_btn:
             sym, trades, st_status = backtest_symbol(
                 sym, period,
                 float(threshold_pct), float(master_law_pct),
-                float(min_risk_pct)
+                float(min_risk_pct), benchmark_df
             )
             if st_status == "ok":
                 all_trades.extend(trades)
@@ -582,6 +659,30 @@ def plot_sl_type_breakdown(df):
     return grp
 
 
+def regime_comparison(df):
+    """เปรียบเทียบ stats แยกตาม regime"""
+    rows = []
+    for regime in ["bull", "bear", "unknown"]:
+        sub = df[df["regime"] == regime]
+        if sub.empty:
+            continue
+        wins = sub[sub["R"] > 0]["R"]
+        losses = sub[sub["R"] <= 0]["R"]
+        pf_num = wins.sum() if len(wins) else 0
+        pf_den = abs(losses.sum()) if len(losses) else 0
+        pf = pf_num / pf_den if pf_den > 0 else float("inf")
+        rows.append({
+            "Regime": regime,
+            "Trades": len(sub),
+            "Win Rate": (sub["R"] > 0).mean(),
+            "Avg R": sub["R"].mean(),
+            "Median R": sub["R"].median(),
+            "Profit Factor": pf,
+            "Total R": sub["R"].sum(),
+        })
+    return pd.DataFrame(rows)
+
+
 # ══════════════════════════════════════════════════════
 #  DISPLAY
 # ══════════════════════════════════════════════════════
@@ -608,7 +709,71 @@ if df.empty:
     **R-Multiple** = (exit − entry) / (entry − SL_initial)
     """)
 else:
-    stats = stats_block(df)
+    # ── Regime Filter View Toggle ──
+    has_regime = "regime" in df.columns and df["regime"].nunique() > 1
+
+    df_filtered = df  # default = all trades
+
+    if has_regime:
+        st.divider()
+        st.subheader("🎯 Market Regime View")
+        regime_view = st.radio(
+            "เลือกมุมมอง",
+            ["🌐 ทั้งหมด (All)", "🟢 Bull only (Filter ON)", "🔴 Bear only", "⚖️ เทียบ Bull vs Bear"],
+            horizontal=True,
+        )
+
+        if regime_view == "🟢 Bull only (Filter ON)":
+            df_filtered = df[df["regime"] == "bull"]
+        elif regime_view == "🔴 Bear only":
+            df_filtered = df[df["regime"] == "bear"]
+        elif regime_view == "⚖️ เทียบ Bull vs Bear":
+            df_filtered = df  # show all but display comparison
+            cmp_df = regime_comparison(df)
+            cmp_show = cmp_df.copy()
+            cmp_show["Win Rate"] = cmp_show["Win Rate"].apply(lambda x: f"{x:.1%}")
+            cmp_show["Avg R"] = cmp_show["Avg R"].apply(lambda x: f"{x:+.3f}")
+            cmp_show["Median R"] = cmp_show["Median R"].apply(lambda x: f"{x:+.3f}")
+            cmp_show["Profit Factor"] = cmp_show["Profit Factor"].apply(
+                lambda x: f"{x:.2f}" if x != float("inf") else "∞"
+            )
+            cmp_show["Total R"] = cmp_show["Total R"].apply(lambda x: f"{x:+.1f}R")
+            st.dataframe(cmp_show, use_container_width=True, hide_index=True)
+
+            # Insight
+            bull = cmp_df[cmp_df["Regime"] == "bull"]
+            bear = cmp_df[cmp_df["Regime"] == "bear"]
+            if len(bull) > 0 and len(bear) > 0:
+                bull_R = float(bull.iloc[0]["Avg R"])
+                bear_R = float(bear.iloc[0]["Avg R"])
+                diff = bull_R - bear_R
+                if diff > 0.1:
+                    st.success(
+                        f"✅ **สมมติฐานยืนยัน!** Bull Edge ({bull_R:+.2f}R) > Bear Edge ({bear_R:+.2f}R) "
+                        f"= ใช้ Filter ดีกว่าไม่ใช้ ({diff:+.2f}R)"
+                    )
+                elif diff < -0.1:
+                    st.warning(
+                        f"⚠️ **ผิดคาด!** Bear Edge ({bear_R:+.2f}R) สูงกว่า Bull ({bull_R:+.2f}R) "
+                        f"— Filter ทำให้แย่ลง"
+                    )
+                else:
+                    st.info(
+                        f"➖ Bull vs Bear ใกล้เคียงกัน ({bull_R:+.2f}R vs {bear_R:+.2f}R) "
+                        f"— Filter ไม่ได้ช่วยเพิ่ม Edge"
+                    )
+
+        # แสดงจำนวน trade ที่กรอง
+        if regime_view != "🌐 ทั้งหมด (All)" and regime_view != "⚖️ เทียบ Bull vs Bear":
+            removed = len(df) - len(df_filtered)
+            removed_pct = removed / len(df) * 100 if len(df) > 0 else 0
+            st.caption(
+                f"แสดง {len(df_filtered):,} จาก {len(df):,} trades "
+                f"(กรองออก {removed:,} = {removed_pct:.1f}%)"
+            )
+
+    # ใช้ df_filtered ในการคำนวณ stats
+    stats = stats_block(df_filtered)
 
     st.divider()
     st.subheader("📊 Overall Performance")
@@ -688,7 +853,7 @@ else:
     x_range = (x_min, x_max)
 
     st.plotly_chart(
-        plot_r_distribution(df, x_range[0], x_range[1], bin_size),
+        plot_r_distribution(df_filtered, x_range[0], x_range[1], bin_size),
         use_container_width=True,
     )
 
@@ -703,11 +868,11 @@ else:
 
     st.divider()
     st.subheader("💰 Equity Curve")
-    st.plotly_chart(plot_equity_curve(df), use_container_width=True)
+    st.plotly_chart(plot_equity_curve(df_filtered), use_container_width=True)
 
     st.divider()
     st.subheader("🎯 SL Type Breakdown")
-    sl_df = plot_sl_type_breakdown(df)
+    sl_df = plot_sl_type_breakdown(df_filtered)
     sl_show = sl_df.copy()
     sl_show["win_rate"] = sl_show["win_rate"].apply(lambda x: f"{x:.1%}")
     sl_show["avg_R"] = sl_show["avg_R"].apply(lambda x: f"{x:.3f}")
@@ -727,7 +892,7 @@ else:
     with fc2:
         sl_filter = st.selectbox(
             "SL Type",
-            ["All"] + sorted(df["sl_type"].unique().tolist()),
+            ["All"] + sorted(df_filtered["sl_type"].unique().tolist()),
             index=0,
         )
     with fc3:
@@ -738,7 +903,7 @@ else:
             index=0,
         )
 
-    df_show = df.copy()
+    df_show = df_filtered.copy()
     if sym_filter:
         df_show = df_show[df_show["symbol"].str.contains(sym_filter.upper(), na=False)]
     if sl_filter != "All":
@@ -755,16 +920,21 @@ else:
     elif sort_by == "risk_pct (สูงสุด)":
         df_show = df_show.sort_values("risk_pct", ascending=False)
 
-    df_display = df_show[[
+    # คอลัมน์ที่จะแสดง (เพิ่ม regime ถ้ามี)
+    cols_base = [
         "symbol", "entry_date", "exit_date", "days_held",
         "entry_price", "exit_price", "sl_initial", "sl_type",
         "risk_pct", "R", "exit_reason"
-    ]].copy()
+    ]
+    if "regime" in df_show.columns:
+        cols_base.insert(1, "regime")  # ใส่ถัดจาก symbol
+
+    df_display = df_show[cols_base].copy()
     df_display["entry_date"] = df_display["entry_date"].dt.strftime("%Y-%m-%d")
     df_display["exit_date"] = df_display["exit_date"].dt.strftime("%Y-%m-%d")
 
     st.dataframe(df_display, use_container_width=True, height=400, hide_index=True)
-    st.caption(f"แสดง {len(df_display):,} จาก {len(df):,} trades")
+    st.caption(f"แสดง {len(df_display):,} จาก {len(df_filtered):,} trades")
 
     csv = df_display.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
