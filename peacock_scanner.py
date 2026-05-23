@@ -183,24 +183,15 @@ def get_symbol_list():
 
     elif preset_used == "sp500":
         try:
-            tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-            symbols = tables[0]["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+            df = pd.read_csv("sp500_symbols.csv")
+            symbols = df["Symbol"].dropna().astype(str).str.strip().tolist()
         except Exception as e:
             st.error(f"ดึง S&P 500 list ไม่สำเร็จ: {e}")
 
     elif preset_used == "set100":
-        # SET100 ต้องต่อ .BK สำหรับ yfinance
         try:
-            tables = pd.read_html("https://en.wikipedia.org/wiki/SET100_Index")
-            # หา column ที่ดูเหมือน symbol
-            for table in tables:
-                for col in table.columns:
-                    if "symbol" in str(col).lower() or "ticker" in str(col).lower():
-                        symbols = table[col].astype(str).str.strip().tolist()
-                        break
-                if symbols:
-                    break
-            symbols = [f"{s}.BK" for s in symbols if s and s != "nan"]
+            df = pd.read_csv("set100_symbols.csv")
+            symbols = df["Symbol"].dropna().astype(str).str.strip().tolist()
         except Exception as e:
             st.error(f"ดึง SET100 list ไม่สำเร็จ: {e}")
 
