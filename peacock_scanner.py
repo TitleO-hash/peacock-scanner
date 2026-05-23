@@ -403,6 +403,16 @@ if scan_button:
 # ══════════════════════════════════════════════════════
 #  DISPLAY RESULTS
 # ══════════════════════════════════════════════════════
+def to_tv_symbol(symbol):
+    """แปลง symbol เป็น format TradingView Watchlist"""
+    if symbol.endswith(".BK"):
+        return f"SET:{symbol.replace('.BK', '')}"
+    elif symbol.endswith(".HK"):
+        return f"HKEX:{symbol.replace('.HK', '')}"
+    else:
+        return symbol
+
+
 def show_group(df_result, group_name, group_key):
     """แสดงตารางของแต่ละ group"""
     if df_result.empty:
@@ -435,6 +445,7 @@ def show_group(df_result, group_name, group_key):
 
     st.dataframe(df_show, use_container_width=True, height=400)
 
+    # ── Download CSV ──
     csv = df_show.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         label=f"💾 Download {group_name} เป็น CSV",
@@ -442,6 +453,17 @@ def show_group(df_result, group_name, group_key):
         file_name=f"peacock_{group_key}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         key=f"dl_{group_key}",
+    )
+
+    # ── Download TradingView Watchlist ──
+    tv_symbols = [to_tv_symbol(s) for s in df_show["Symbol"].tolist()]
+    tv_watchlist = ",".join(tv_symbols)
+    st.download_button(
+        label=f"📺 Download {group_name} เป็น TradingView Watchlist",
+        data=tv_watchlist.encode("utf-8"),
+        file_name=f"peacock_{group_key}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+        mime="text/plain",
+        key=f"dl_tv_{group_key}",
     )
 
     if not df_show.empty:
