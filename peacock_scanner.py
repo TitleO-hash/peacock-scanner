@@ -346,7 +346,7 @@ def fetch_one(symbol, period):
     """ดึงข้อมูลหุ้น 1 ตัว"""
     try:
         df = yf.download(symbol, period=period, interval="1d",
-                         progress=False, auto_adjust=False, threads=False)
+                         progress=False, auto_adjust=True, threads=False)
         if df.empty:
             return None
         if isinstance(df.columns, pd.MultiIndex):
