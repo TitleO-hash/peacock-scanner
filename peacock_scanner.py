@@ -208,7 +208,20 @@ def get_symbol_list():
 
 
 def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+    # ใช้วิธีเดียวกับ TradingView คือ
+    # ใช้ค่าเฉลี่ยธรรมดาของ N วันแรกเป็นจุดตั้งต้น
+    # แล้วค่อยคำนวณ EMA ต่อจากนั้น
+    ema = series.copy().astype(float)
+    if len(series) < period:
+        return ema * float("nan")
+    # จุดตั้งต้น = ค่าเฉลี่ยธรรมดาของ period วันแรก
+    ema.iloc[:period - 1] = float("nan")
+    ema.iloc[period - 1] = series.iloc[:period].mean()
+    # คำนวณ EMA ต่อจากนั้น
+    multiplier = 2 / (period + 1)
+    for i in range(period, len(series)):
+        ema.iloc[i] = (series.iloc[i] - ema.iloc[i - 1]) * multiplier + ema.iloc[i - 1]
+    return ema
 
 
 def is_peacock_bar(row, chain_emas, long_filter):
