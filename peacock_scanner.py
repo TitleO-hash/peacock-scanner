@@ -132,9 +132,9 @@ with st.sidebar:
     st.header("📅 ช่วงข้อมูล")
     history_period = st.selectbox(
         "ดึงข้อมูลย้อนหลัง",
-        ["6mo", "1y", "2y", "5y"],
-        index=1,
-        help="ต้องยาวพอสำหรับ EMA period ที่ใช้"
+        ["1y", "2y", "5y"],
+        index=0,
+        help="แนะนำอย่างน้อย 1 ปี เพื่อให้ EMA200 คำนวณได้แม่นยำ"
     )
 
     st.divider()
@@ -235,12 +235,12 @@ def is_pre_peacock_bar(row, chain_emas, long_filter):
     เช็คว่าแท่งนี้เป็น "จ่อตัดครบ" หรือไม่
       - EMA chain เรียงครบ: chain[0] > chain[1] > ... > chain[n-1]
       - Close > long_filter (EMA200)
-      - แต่ Close <= chain[0] (= EMA10)  ← ยังตัดไม่ครบ
+      - แต่ Close <= chain[0]  ← ยังตัดไม่ครบ
     """
     if not chain_emas:
         return False
     close = row["Close"]
-    # Close ต้องยังไม่ทะลุ EMA10
+    # Close ต้องยังไม่ทะลุ EMA เส้นสั้นที่สุด
     if close > row[chain_emas[0]["name"]]:
         return False
     # EMA chain ต้องเรียงครบ
@@ -257,13 +257,10 @@ def is_pre_peacock_bar(row, chain_emas, long_filter):
 def classify_peacock(df, ema_settings):
     """
     จำแนกหุ้นเป็น 1 ใน 4 ประเภท:
-      'pre'          = จ่อตัดครบ (EMA chain เรียงครบ + >EMA200 แต่ยังไม่ทะลุ EMA10)
-      'fresh_today'  = ตัดครบวันนี้วันแรก (วันนี้ผ่าน, เมื่อวานไม่ผ่าน)
-      'recent'       = ตัดครบมาแล้ว N+1 วัน (วันนี้ผ่าน, ตัดเมื่อ N+1 วันก่อน, N >= 1)
-                        days_ago = ตัดเมื่อกี่วันก่อน (1=เมื่อวาน, 2=วันก่อนเมื่อวาน, ...)
+      'pre'          = จ่อตัดครบ
+      'fresh_today'  = ตัดครบวันนี้วันแรก
+      'recent'       = ตัดครบมาแล้ว N วัน
       None           = ไม่เข้าเงื่อนไขใดๆ
-    
-    Return: (category, days_ago_or_None, latest_data_dict)
     """
     if df.empty or len(df) < 2:
         return None, None, None
@@ -280,7 +277,6 @@ def classify_peacock(df, ema_settings):
     for ema in enabled_emas:
         df[ema["name"]] = calc_ema(df["Close"], ema["period"])
 
-    # แยก slot 0-3 (chain เส้นสั้น) กับ slot 4 (long filter)
     chain_emas = [ema_settings[i] for i in range(min(4, len(ema_settings)))
                   if ema_settings[i]["enabled"]]
     long_filter = (ema_settings[4]
@@ -293,42 +289,35 @@ def classify_peacock(df, ema_settings):
     is_peacock_today = is_peacock_bar(last, chain_emas, long_filter)
 
     if is_peacock_today:
-        # ตัดครบแล้ว — หาว่าตัดเมื่อกี่วันก่อน (เมื่อวาน = 1, วันก่อนเมื่อวาน = 2, ...)
-        # กฎ: หา i ที่เล็กที่สุดที่ df.iloc[-i-1] ไม่ผ่าน Peacock
-        # i=1 → เมื่อวาน, i=2 → 2 วันก่อน
         days_since_cross = None
-        for i in range(1, min(len(df), 60)):  # ดูย้อนหลังไม่เกิน 60 วัน
+        for i in range(1, min(len(df), 60)):
             past_row = df.iloc[-i - 1]
             if not is_peacock_bar(past_row, chain_emas, long_filter):
                 days_since_cross = i
                 break
 
         if days_since_cross is None:
-            # ตัดมานานเกิน 60 วัน — เก็บไว้ใน recent ที่ days = 60+
             days_since_cross = 60
 
         category = "fresh_today" if days_since_cross == 1 else "recent"
         days_ago = 0 if category == "fresh_today" else days_since_cross - 1
-        # days_ago: สำหรับ recent → 1 = เมื่อวาน, 2 = 2 วันก่อน
-        # (วันนี้ผ่าน + เมื่อวานไม่ผ่าน → days_since_cross=1 → fresh_today, days_ago=0)
-        # (วันนี้ผ่าน + เมื่อวานก็ผ่าน + 2 วันก่อนไม่ผ่าน → days_since_cross=2 → recent, days_ago=1)
 
         result = _build_result_dict(last, enabled_emas)
-        result["Days Since Cross"] = days_since_cross
+        if category == "recent":
+            result["Days Ago"] = days_ago
         return category, days_ago, result
 
-    # ── เช็ค Pre-Peacock (จ่อตัดครบ) ──
+    # ── เช็ค Pre-Peacock ──
     if is_pre_peacock_bar(last, chain_emas, long_filter):
         result = _build_result_dict(last, enabled_emas)
-        # คำนวณ % ที่ Close ห่างจาก EMA10 (ติดลบ = ใต้ EMA10)
         gap_pct = (last["Close"] / last[chain_emas[0]["name"]] - 1) * 100
-        result["Gap to EMA10 %"] = round(gap_pct, 2)
+        result["Gap to EMA เส้นสั้นสุด %"] = round(gap_pct, 2)
         return "pre", None, result
 
     return None, None, None
 
 
-def _build_result_dict(last_row, enabled_emas, df=None):
+def _build_result_dict(last_row, enabled_emas):
     """สร้าง dict ของผลลัพธ์ row หนึ่ง"""
     close = last_row["Close"]
     result = {
@@ -347,7 +336,6 @@ def fetch_one(symbol, period):
                          progress=False, auto_adjust=False, threads=False)
         if df.empty:
             return None
-        # yfinance บางที return MultiIndex column
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
@@ -370,9 +358,9 @@ if scan_button:
     progress = st.progress(0.0)
     status = st.empty()
 
-    pre_results = []        # 🟡 จ่อตัดครบ
-    fresh_results = []      # 🔥 ตัดครบวันนี้
-    recent_results = []     # 🌟 ตัดครบ N วันก่อน
+    pre_results = []
+    fresh_results = []
+    recent_results = []
     errors = []
 
     for i, sym in enumerate(symbols):
@@ -387,9 +375,8 @@ if scan_button:
             elif category == "fresh_today":
                 fresh_results.append({"Symbol": sym, **data})
             elif category == "recent":
-                # filter ตาม range ที่ user เลือก
                 if recent_min <= days_ago <= recent_max:
-                    recent_results.append({"Symbol": sym, "Days Ago": days_ago, **data})
+                    recent_results.append({"Symbol": sym, **data})
         progress.progress((i + 1) / len(symbols))
 
     status.empty()
@@ -412,20 +399,17 @@ if scan_button:
 # ══════════════════════════════════════════════════════
 #  DISPLAY RESULTS
 # ══════════════════════════════════════════════════════
-def show_group(df_result, group_name, group_key, tv_key_suffix=""):
+def show_group(df_result, group_name, group_key):
     """แสดงตารางของแต่ละ group"""
     if df_result.empty:
         st.info(f"ไม่มีหุ้นในกลุ่ม {group_name} ครับ")
         return
 
-    # เรียงลำดับ column
     base_order = ["Symbol", "Date", "Close"]
     if "Days Ago" in df_result.columns:
         base_order.append("Days Ago")
-    if "Days Since Cross" in df_result.columns:
-        base_order.append("Days Since Cross")
-    if "Gap to EMA10 %" in df_result.columns:
-        base_order.append("Gap to EMA10 %")
+    if "Gap to EMA เส้นสั้นสุด %" in df_result.columns:
+        base_order.append("Gap to EMA เส้นสั้นสุด %")
 
     ema_cols = [c for c in df_result.columns if c.startswith("EMA")]
     ema_cols_sorted = sorted(ema_cols, key=lambda c: int(c.replace("EMA", "").strip()))
@@ -434,7 +418,6 @@ def show_group(df_result, group_name, group_key, tv_key_suffix=""):
     col_order = [c for c in col_order if c in df_result.columns]
     df_show = df_result[col_order].copy()
 
-    # ── Filter / Sort ──
     col1, col2 = st.columns([2, 1])
     with col1:
         search = st.text_input("🔍 ค้นหา symbol", "", key=f"search_{group_key}")
@@ -448,7 +431,6 @@ def show_group(df_result, group_name, group_key, tv_key_suffix=""):
 
     st.dataframe(df_show, use_container_width=True, height=400)
 
-    # ── Download CSV ──
     csv = df_show.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         label=f"💾 Download {group_name} เป็น CSV",
@@ -458,12 +440,11 @@ def show_group(df_result, group_name, group_key, tv_key_suffix=""):
         key=f"dl_{group_key}",
     )
 
-    # ── TradingView Link ──
     if not df_show.empty:
         selected = st.selectbox(
             "📈 เปิดใน TradingView",
             df_show["Symbol"].tolist(),
-            key=f"tv_{group_key}{tv_key_suffix}",
+            key=f"tv_{group_key}",
         )
         if selected:
             tv_symbol = selected
@@ -482,39 +463,40 @@ if st.session_state.scan_done:
     recent_df = st.session_state.get("recent_results", pd.DataFrame())
     rng = st.session_state.get("recent_range", (1, 1))
 
-    # ── Stats รวม ──
     c1, c2, c3 = st.columns(3)
     c1.metric("🟡 จ่อตัดครบ", len(pre_df))
     c2.metric("🔥 ตัดครบวันนี้", len(fresh_df))
     c3.metric(f"🌟 ตัดครบ {rng[0]}-{rng[1]} วันก่อน", len(recent_df))
 
-    # ── 3 Tabs ──
     tab1, tab2, tab3 = st.tabs([
         f"🟡 จ่อตัดครบ ({len(pre_df)})",
         f"🔥 ตัดครบวันนี้ ({len(fresh_df)})",
         f"🌟 ตัด {rng[0]}-{rng[1]} วันก่อน ({len(recent_df)})",
     ])
 
+    # ดึงชื่อ EMA เส้นสั้นสุดที่ enabled สำหรับ caption
+    enabled_chain = [e for e in ema_settings[:4] if e["enabled"]]
+    shortest_ema_name = enabled_chain[0]["name"] if enabled_chain else "EMA เส้นสั้นสุด"
+
     with tab1:
-        st.caption("EMA10 > EMA20 > EMA35 > EMA75 และ Close > EMA200 — แต่ Close ยังไม่ทะลุ EMA10")
+        st.caption(f"EMA chain เรียงครบ + Close > EMA200 — แต่ Close ยังไม่ทะลุ {shortest_ema_name}")
         show_group(pre_df, "จ่อตัดครบ", "pre")
 
     with tab2:
-        st.caption("Close > EMA10 > EMA20 > EMA35 > EMA75 และ Close > EMA200 — เพิ่งครบวันนี้วันแรก")
+        st.caption(f"Close > {shortest_ema_name} > ... > EMA75 และ Close > EMA200 — เพิ่งครบวันนี้วันแรก")
         show_group(fresh_df, "ตัดครบวันนี้", "fresh")
 
     with tab3:
         st.caption(f"ครบเงื่อนไข Peacock มาแล้ว {rng[0]}-{rng[1]} วันก่อน (1 = เมื่อวาน)")
         show_group(recent_df, f"ตัด {rng[0]}-{rng[1]} วันก่อน", "recent")
 
-    # ── Errors ──
     if st.session_state.scan_errors:
         with st.expander(f"⚠️ Symbol ที่ดึงข้อมูลไม่สำเร็จ ({len(st.session_state.scan_errors)} ตัว)"):
             st.write(", ".join(st.session_state.scan_errors))
 
 
 # ══════════════════════════════════════════════════════
-#  FOOTER — แสดง legend สี EMA
+#  FOOTER
 # ══════════════════════════════════════════════════════
 st.divider()
 with st.expander("ℹ️ เกี่ยวกับสูตร Peacock"):
@@ -526,7 +508,7 @@ with st.expander("ℹ️ เกี่ยวกับสูตร Peacock"):
 2. `Close > EMA200`
 
 **3 กลุ่มที่ scanner แยก:**
-- 🟡 **จ่อตัดครบ** — EMA เรียงครบ + Close > EMA200 แต่ Close ยังไม่ทะลุ EMA10
+- 🟡 **จ่อตัดครบ** — EMA เรียงครบ + Close > EMA200 แต่ Close ยังไม่ทะลุ EMA เส้นสั้นสุด
 - 🔥 **ตัดครบวันนี้** — เข้าเงื่อนไข Peacock เต็มวันนี้ (เมื่อวานยังไม่ผ่าน)
 - 🌟 **ตัดครบ N วันก่อน** — ครบมาแล้ว N วัน (1 = เมื่อวาน)
 
