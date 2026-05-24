@@ -35,7 +35,25 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from scipy import stats as scipy_stats
+import math as _math
+
+def _norm_cdf(x):
+    """Cumulative normal distribution"""
+    return (1 + _math.erf(x / _math.sqrt(2))) / 2
+
+def ttest_1samp_numpy(a, popmean=0):
+    """t-test แบบ 1-sample ด้วย numpy ล้วนๆ ไม่ต้องใช้ scipy"""
+    a = np.array(a, dtype=float)
+    n = len(a)
+    if n < 2:
+        return None, None
+    mean = a.mean()
+    std = a.std(ddof=1)
+    if std == 0:
+        return None, None
+    t_stat = (mean - popmean) / (std / np.sqrt(n))
+    p_value = 2 * (1 - _norm_cdf(abs(t_stat)))
+    return float(t_stat), float(p_value)
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -532,7 +550,7 @@ def stats_block(df):
     # t-test
     t_stat, p_value = (None, None)
     if len(df) >= 30:
-        t_stat, p_value = scipy_stats.ttest_1samp(df["R"].values, 0)
+        t_stat, p_value = ttest_1samp_numpy(df["R"].values)
 
     return {
         "n": len(df),
