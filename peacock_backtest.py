@@ -85,14 +85,27 @@ with st.sidebar:
     st.header("📁 Universe")
     universe_choice = st.radio(
         "เลือก Market",
-        ["อัพโหลด CSV", "S&P 500 (preset)", "SET100 (preset)", "พิมพ์เอง"],
+        ["อัพโหลด CSV", "S&P 500 (preset)", "SET100 (preset)", "สุ่ม (Random)", "พิมพ์เอง"],
         index=0,
     )
 
     uploaded_file = None
     typed_symbols = ""
+    random_source = "S&P 500 (preset)"
+    random_n = 30
     if universe_choice == "อัพโหลด CSV":
         uploaded_file = st.file_uploader("CSV (มีคอลัมน์ Symbol)", type=["csv"])
+    elif universe_choice == "สุ่ม (Random)":
+        random_source = st.selectbox(
+            "สุ่มจาก Universe ไหน",
+            ["S&P 500 (preset)", "SET100 (preset)"],
+        )
+        random_n = st.number_input(
+            "จำนวน symbol ที่จะสุ่ม",
+            min_value=10, max_value=500, value=30, step=5,
+            help="Default 30 = อย่างน้อย ~1,800 trades → t-test แม่นมาก\n10 = เร็วมาก แต่ผลอาจไม่ representative\n100+ = ครอบคลุมกว่า แต่ใช้เวลานานขึ้น"
+        )
+        st.caption(f"คาดได้ ~{random_n * 60:,} trades (ประมาณการ)")
     elif universe_choice == "พิมพ์เอง":
         typed_symbols = st.text_area(
             "พิมพ์ symbol คั่นด้วย comma หรือ newline",
@@ -149,8 +162,9 @@ with st.sidebar:
         value=True,
         help="เทรดเฉพาะตอน Benchmark > EMA200 (ตลาดขาขึ้น)"
     )
-    benchmark_default = "SPY" if universe_choice == "S&P 500 (preset)" else (
-        "^SET.BK" if universe_choice == "SET100 (preset)" else "SPY"
+    _src = random_source if universe_choice == "สุ่ม (Random)" else universe_choice
+    benchmark_default = "SPY" if "S&P 500" in _src else (
+        "^SET.BK" if "SET100" in _src else "SPY"
     )
     benchmark_symbol = st.text_input(
         "Benchmark Symbol",
@@ -416,6 +430,16 @@ def get_symbols():
             return load_preset(SET100_URL)
         except Exception as e:
             st.error(f"โหลด SET100 preset ไม่ได้: {e}")
+            return []
+    elif universe_choice == "สุ่ม (Random)":
+        try:
+            url = SP500_URL if "S&P 500" in random_source else SET100_URL
+            all_syms = load_preset(url)
+            n = min(int(random_n), len(all_syms))
+            sampled = np.random.choice(all_syms, size=n, replace=False).tolist()
+            return sampled
+        except Exception as e:
+            st.error(f"สุ่ม symbol ไม่ได้: {e}")
             return []
     elif universe_choice == "อัพโหลด CSV" and uploaded_file:
         df = pd.read_csv(uploaded_file)
