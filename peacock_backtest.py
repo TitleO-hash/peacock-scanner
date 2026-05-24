@@ -1,5 +1,5 @@
 """
-🦚 Peacock Backtest V3 — R-Multiple Edge Validator
+🦚 Peacock Backtest V4 — R-Multiple Edge Validator
 ==================================================
 Backtest กลยุทธ์ Peacock เพื่อพิสูจน์ว่ามี Edge จริงหรือไม่
 
@@ -8,22 +8,25 @@ ENTRY:
 
 EXIT:
   - Initial SL (วัน entry):
-    * ถ้า (Close − EMA200)/EMA200 > 3% → SL = EMA10
+    * ถ้า (Open_T+1 − EMA200)/EMA200 > 3% → SL = EMA10
     * ถ้า ≤ 3% → SL = EMA200
     * Master Law (ขอบบน): SL ห่างจาก entry ไม่เกิน 3%
-    * Min Risk (ขอบล่าง): SL ห่างจาก entry ไม่ต่ำกว่า 1% ← V3 NEW
+    * Min Risk (ขอบล่าง): SL ห่างจาก entry ไม่ต่ำกว่า 1%
   - Trailing: ทุกวัน Stop = max(SL_initial, EMA20)
     EXIT เมื่อ Close < Stop → ขายที่ next Open
 
-R-Multiple = (exit − entry) / (entry − SL_initial)
+R-Multiple = (exit − entry) / (entry − SL_initial) − fee_R
+fee_R = (entry × fee_pct × 2) / risk_unit  ← round-trip
 
-V3 Changes:
-  - เพิ่ม Min Risk floor (ป้องกัน R ระเบิดเมื่อ EMA candidate ใกล้ entry มาก)
-  - sl_type มี suffix +MinR เมื่อติด floor
-  - sidebar เพิ่ม Min Risk per Trade input
+V4 Changes (QC):
+  - Issue #2: เพิ่ม Survivorship Bias warning ตอน Run
+  - Issue #3: still_open แยกออกจาก stats หลัก
+  - Issue #5: เพิ่ม Fee Input (default 0.1%) หักจาก R
+  - Issue #7: t-test + เตือนถ้า trade < 30
+  - Executive Summary: 3 ข้อด้านบนสุด
 
 วิธีรัน:
-  pip install streamlit yfinance pandas plotly
+  pip install streamlit yfinance pandas plotly scipy
   streamlit run peacock_backtest.py
 """
 
@@ -32,6 +35,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from scipy import stats as scipy_stats
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -62,8 +66,8 @@ if "scan_summary" not in st.session_state:
 with st.sidebar:
     st.header("📁 Universe")
     universe_choice = st.radio(
-        "เลือกตลาด",
-        ["S&P 500", "SET100", "อัพโหลด CSV", "พิมพ์เอง"],
+        "เลือก Market",
+        ["อัพโหลด CSV", "S&P 500 (preset)", "SET100 (preset)", "พิมพ์เอง"],
         index=0,
     )
 
@@ -73,7 +77,7 @@ with st.sidebar:
         uploaded_file = st.file_uploader("CSV (มีคอลัมน์ Symbol)", type=["csv"])
     elif universe_choice == "พิมพ์เอง":
         typed_symbols = st.text_area(
-            "พิมพ์ symbol คั่นด้วย comma",
+            "พิมพ์ symbol คั่นด้วย comma หรือ newline",
             placeholder="AAPL, MSFT, NVDA",
             height=80,
         )
@@ -94,7 +98,7 @@ with st.sidebar:
     threshold_pct = st.number_input(
         "Threshold ลอยตัวสูง (%)",
         min_value=0.5, max_value=20.0, value=3.0, step=0.5,
-        help="(Close−EMA200)/EMA200 เกินค่านี้ → ใช้ EMA10 SL"
+        help="(Open_T+1−EMA200)/EMA200 เกินค่านี้ → ใช้ EMA10 SL"
     )
 
     master_law_pct = st.number_input(
@@ -106,8 +110,19 @@ with st.sidebar:
     min_risk_pct = st.number_input(
         "🛡️ Min Risk per Trade (%)",
         min_value=0.0, max_value=3.0, value=1.0, step=0.1,
-        help="SL ห่างจาก entry ขั้นต่ำ — ถ้า EMA candidate ใกล้กว่านี้จะถูกขยับออก ป้องกัน R ระเบิด (ขอบล่าง)"
+        help="SL ห่างจาก entry ขั้นต่ำ (ขอบล่าง)"
     )
+
+    # ── V4: Fee Input ──────────────────────────────────
+    st.divider()
+    st.header("💸 Transaction Cost")
+    fee_pct = st.number_input(
+        "ค่า Fee ต่อข้าง (%)",
+        min_value=0.0, max_value=1.0, value=0.1, step=0.01,
+        format="%.2f",
+        help="คิดเป็น Round-trip (ซื้อ + ขาย) อัตโนมัติ\nS&P 500 ≈ 0.05–0.10% | SET100 ≈ 0.15–0.20%"
+    )
+    st.caption(f"Round-trip รวม = **{fee_pct * 2:.2f}%** ต่อ trade")
 
     st.divider()
     st.header("🎯 Market Regime Filter")
@@ -116,20 +131,18 @@ with st.sidebar:
         value=True,
         help="เทรดเฉพาะตอน Benchmark > EMA200 (ตลาดขาขึ้น)"
     )
-    benchmark_default = "SPY" if universe_choice == "S&P 500" else (
-        "^SET.BK" if universe_choice == "SET100" else "SPY"
+    benchmark_default = "SPY" if universe_choice == "S&P 500 (preset)" else (
+        "^SET.BK" if universe_choice == "SET100 (preset)" else "SPY"
     )
     benchmark_symbol = st.text_input(
         "Benchmark Symbol",
         value=benchmark_default,
         disabled=not use_regime,
-        help="SPY = S&P 500 | ^SET.BK = SET Index | ^GSPC = S&P 500 raw"
     )
     regime_ema_period = st.number_input(
         "Regime EMA Period",
         min_value=50, max_value=300, value=200, step=10,
         disabled=not use_regime,
-        help="200 = standard"
     )
 
     st.divider()
@@ -155,7 +168,6 @@ def calc_ema(s, p):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_benchmark(symbol, period, ema_period):
-    """โหลด benchmark + คำนวณ EMA + คืน DataFrame ที่ index ตรงกับ trading days"""
     try:
         df = yf.download(
             symbol, period=period, interval="1d",
@@ -166,7 +178,6 @@ def load_benchmark(symbol, period, ema_period):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df["EMA"] = calc_ema(df["Close"], ema_period)
-        # Series boolean: True = bull regime
         df["is_bull"] = df["Close"] > df["EMA"]
         return df[["Close", "EMA", "is_bull"]]
     except Exception:
@@ -174,11 +185,9 @@ def load_benchmark(symbol, period, ema_period):
 
 
 def get_regime_at(benchmark_df, date):
-    """เช็ค regime ที่วันใดวันหนึ่ง — คืน 'bull' / 'bear' / 'unknown'"""
     if benchmark_df is None:
         return "unknown"
     try:
-        # หา trading day ที่ใกล้ที่สุด (ก่อนหรือเท่ากับ date)
         idx = benchmark_df.index.searchsorted(date, side="right") - 1
         if idx < 0:
             return "unknown"
@@ -189,7 +198,6 @@ def get_regime_at(benchmark_df, date):
 
 
 def add_emas(df):
-    """เพิ่ม EMA 5 เส้นใน dataframe"""
     df = df.copy()
     df["EMA10"] = calc_ema(df["Close"], 10)
     df["EMA20"] = calc_ema(df["Close"], 20)
@@ -200,7 +208,6 @@ def add_emas(df):
 
 
 def is_peacock_series(df):
-    """Vectorized: Close > EMA10 > EMA20 > EMA35 > EMA75 และ Close > EMA200"""
     c = df["Close"]
     return (
         (c > df["EMA10"])
@@ -212,21 +219,23 @@ def is_peacock_series(df):
 
 
 def find_fresh_signals(df):
-    """หา index ของ Fresh Today: วันนี้ผ่าน Peacock + เมื่อวานไม่ผ่าน"""
     peacock = is_peacock_series(df)
     fresh = peacock & ~peacock.shift(1, fill_value=False)
     return np.where(fresh.values)[0]
 
 
-def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1.0):
+def simulate_trade(df, signal_idx, threshold_pct, master_law_pct,
+                   min_risk_pct=1.0, fee_pct=0.1):
     """
     จำลอง 1 trade ตาม Peacock rules
-    
+
     SL Logic:
-      1. คำนวณ candidate (EMA10 ถ้าลอยสูง, EMA200 ถ้าใกล้)
-      2. Apply Master Law cap (SL ห่าง entry ไม่เกิน max_risk_pct)
-      3. Apply Min Risk floor (SL ห่าง entry ไม่ต่ำกว่า min_risk_pct)
-         → ป้องกัน R ระเบิดจาก SL candidate ใกล้ entry มากเกินไป
+      ใช้ Open ของ T+1 (entry_price) ตัดสินใจ SL
+      เพราะตอนเปิดตลาด trader เห็นราคาจริงรวม gap แล้ว
+    
+    Fee:
+      Round-trip = fee_pct × 2
+      แปลงเป็น R แล้วหักออก = (entry × fee_pct × 2) / risk_unit
     """
     if signal_idx + 1 >= len(df):
         return None
@@ -240,6 +249,7 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
     ema10 = float(signal_bar["EMA10"])
     ema200 = float(signal_bar["EMA200"])
 
+    # ใช้ entry_price (Open T+1) เพราะ trader รู้ราคาจริงตอนเปิดตลาด
     distance = (entry_price - ema200) / ema200
 
     if distance > threshold_pct / 100:
@@ -256,7 +266,6 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
         sl_type = f"{sl_type}+ML"
 
     # Min Risk: SL ต้องไม่ใกล้กว่า min_risk_pct (ขอบล่าง)
-    # ถ้า candidate ใกล้เกินไป → ขยับ SL ออกให้ห่างขึ้น
     sl_min_ceiling = entry_price * (1 - min_risk_pct / 100)
     if sl_initial > sl_min_ceiling:
         sl_initial = sl_min_ceiling
@@ -266,6 +275,9 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
         return None
 
     risk_unit = entry_price - sl_initial
+
+    # คำนวณ fee เป็น R (round-trip)
+    fee_R = (entry_price * fee_pct / 100 * 2) / risk_unit
 
     for i in range(entry_idx, len(df)):
         bar = df.iloc[i]
@@ -282,7 +294,8 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
                 exit_bar = bar
                 exit_price = float(exit_bar["Close"])
 
-            R = (exit_price - entry_price) / risk_unit
+            R_gross = (exit_price - entry_price) / risk_unit
+            R_net = R_gross - fee_R
             return {
                 "entry_date": entry_date,
                 "exit_date": exit_bar.name,
@@ -291,14 +304,17 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
                 "sl_initial": round(sl_initial, 4),
                 "sl_type": sl_type,
                 "risk_pct": round(risk_unit / entry_price * 100, 2),
-                "R": round(R, 3),
+                "R_gross": round(R_gross, 3),
+                "R": round(R_net, 3),
+                "fee_R": round(fee_R, 3),
                 "days_held": exit_idx - entry_idx,
                 "exit_reason": "trailing/SL",
                 "_exit_idx_in_df": exit_idx,
             }
 
     last_bar = df.iloc[-1]
-    R = (float(last_bar["Close"]) - entry_price) / risk_unit
+    R_gross = (float(last_bar["Close"]) - entry_price) / risk_unit
+    R_net = R_gross - fee_R
     return {
         "entry_date": entry_date,
         "exit_date": last_bar.name,
@@ -307,7 +323,9 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
         "sl_initial": round(sl_initial, 4),
         "sl_type": sl_type,
         "risk_pct": round(risk_unit / entry_price * 100, 2),
-        "R": round(R, 3),
+        "R_gross": round(R_gross, 3),
+        "R": round(R_net, 3),
+        "fee_R": round(fee_R, 3),
         "days_held": len(df) - 1 - entry_idx,
         "exit_reason": "still_open",
         "_exit_idx_in_df": len(df) - 1,
@@ -315,8 +333,7 @@ def simulate_trade(df, signal_idx, threshold_pct, master_law_pct, min_risk_pct=1
 
 
 def backtest_symbol(symbol, period, threshold_pct, master_law_pct,
-                    min_risk_pct=1.0, benchmark_df=None):
-    """Backtest หุ้น 1 ตัว → คืน list ของ trades พร้อม regime tag"""
+                    min_risk_pct=1.0, fee_pct=0.1, benchmark_df=None):
     try:
         df = yf.download(
             symbol, period=period, interval="1d",
@@ -337,11 +354,11 @@ def backtest_symbol(symbol, period, threshold_pct, master_law_pct,
             if idx < 200:
                 continue
 
-            trade = simulate_trade(df, idx, threshold_pct, master_law_pct, min_risk_pct)
+            trade = simulate_trade(df, idx, threshold_pct, master_law_pct,
+                                   min_risk_pct, fee_pct)
             if trade is None:
                 continue
             trade["symbol"] = symbol
-            # tag regime at signal day (วันก่อน entry)
             signal_date = df.index[idx]
             trade["regime"] = get_regime_at(benchmark_df, signal_date)
             trades.append(trade)
@@ -355,36 +372,32 @@ def backtest_symbol(symbol, period, threshold_pct, master_law_pct,
 # ══════════════════════════════════════════════════════
 #  SYMBOL LIST LOADERS
 # ══════════════════════════════════════════════════════
-@st.cache_data(ttl=86400)
-def load_sp500():
-    tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-    syms = tables[0]["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-    return syms
+SP500_URL = "https://raw.githubusercontent.com/TitleO-hash/peacock-scanner/main/sp500_symbols.csv"
+SET100_URL = "https://raw.githubusercontent.com/TitleO-hash/peacock-scanner/main/set100_symbols.csv"
 
 
 @st.cache_data(ttl=86400)
-def load_set100():
-    tables = pd.read_html("https://en.wikipedia.org/wiki/SET100_Index")
-    for table in tables:
-        for col in table.columns:
-            if "symbol" in str(col).lower() or "ticker" in str(col).lower():
-                syms = table[col].astype(str).str.strip().tolist()
-                return [f"{s}.BK" for s in syms if s and s != "nan"]
-    return []
+def load_preset(url):
+    df = pd.read_csv(url)
+    # รองรับทั้ง column ชื่อ Symbol, symbol, Ticker, ticker
+    for col in df.columns:
+        if col.strip().lower() in ("symbol", "ticker", "symbols"):
+            return df[col].dropna().astype(str).str.strip().tolist()
+    return df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
 
 
 def get_symbols():
-    if universe_choice == "S&P 500":
+    if universe_choice == "S&P 500 (preset)":
         try:
-            return load_sp500()
+            return load_preset(SP500_URL)
         except Exception as e:
-            st.error(f"โหลด S&P 500 ไม่ได้: {e}")
+            st.error(f"โหลด S&P 500 preset ไม่ได้: {e}")
             return []
-    elif universe_choice == "SET100":
+    elif universe_choice == "SET100 (preset)":
         try:
-            return load_set100()
+            return load_preset(SET100_URL)
         except Exception as e:
-            st.error(f"โหลด SET100 ไม่ได้: {e}")
+            st.error(f"โหลด SET100 preset ไม่ได้: {e}")
             return []
     elif universe_choice == "อัพโหลด CSV" and uploaded_file:
         df = pd.read_csv(uploaded_file)
@@ -409,7 +422,14 @@ if run_btn:
     if limit_n > 0:
         symbols = symbols[:int(limit_n)]
 
-    # ── โหลด Benchmark สำหรับ Regime Filter ──
+    # ── V4: Survivorship Bias Warning ─────────────────
+    st.warning(
+        "⚠️ **Survivorship Bias:** Universe นี้ใช้หุ้นที่ยังอยู่ในดัชนี **ณ วันนี้** เท่านั้น "
+        "หุ้นที่เคยอยู่แต่ถูกถอดออกหรือล้มละลายไปแล้วไม่ถูกนับ "
+        "ผลลัพธ์จึงอาจดีกว่าความเป็นจริงในอดีต — **ใช้ตัวเลขนี้เป็น upper bound ครับ**"
+    )
+
+    # ── โหลด Benchmark ────────────────────────────────
     benchmark_df = None
     if use_regime:
         with st.spinner(f"กำลังโหลด benchmark {benchmark_symbol}..."):
@@ -424,7 +444,7 @@ if run_btn:
                 f"ตลาดเป็น **bull {bull_pct:.1f}%** ของช่วงเวลา ({period})"
             )
 
-    st.info(f"กำลัง backtest {len(symbols)} ตัว... (period: {period})")
+    st.info(f"กำลัง backtest {len(symbols)} ตัว... (period: {period}, fee: {fee_pct}% ต่อข้าง)")
 
     progress = st.progress(0.0)
     status = st.empty()
@@ -437,7 +457,7 @@ if run_btn:
             futures = {
                 ex.submit(backtest_symbol, sym, period,
                           float(threshold_pct), float(master_law_pct),
-                          float(min_risk_pct), benchmark_df): sym
+                          float(min_risk_pct), float(fee_pct), benchmark_df): sym
                 for sym in symbols
             }
             done = 0
@@ -456,7 +476,7 @@ if run_btn:
             sym, trades, st_status = backtest_symbol(
                 sym, period,
                 float(threshold_pct), float(master_law_pct),
-                float(min_risk_pct), benchmark_df
+                float(min_risk_pct), float(fee_pct), benchmark_df
             )
             if st_status == "ok":
                 all_trades.extend(trades)
@@ -480,26 +500,40 @@ if run_btn:
         "n_symbols": len(symbols),
         "n_ok": len(symbols) - len(errors),
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "fee_pct": fee_pct,
     }
 
-    st.success(f"✅ Backtest เสร็จ! เจอ {len(df_trades)} trades จาก {len(symbols)} ตัว")
+    n_open = (df_trades["exit_reason"] == "still_open").sum() if not df_trades.empty else 0
+    n_closed = len(df_trades) - n_open
+    st.success(
+        f"✅ Backtest เสร็จ! เจอ **{len(df_trades):,} trades** จาก {len(symbols)} ตัว "
+        f"(ปิดแล้ว {n_closed:,} | ยังเปิด {n_open:,})"
+    )
 
 
 # ══════════════════════════════════════════════════════
-#  ANALYTICS & VISUALIZATION
+#  ANALYTICS
 # ══════════════════════════════════════════════════════
 def stats_block(df):
-    """คำนวณสถิติของชุด trades"""
+    """คำนวณสถิติจาก Closed trades เท่านั้น"""
     if df.empty:
         return {"n": 0, "win_rate": 0, "avg_R": 0, "median_R": 0,
                 "pf": 0, "max_R": 0, "min_R": 0,
                 "avg_win": 0, "avg_loss": 0,
-                "p25": 0, "p75": 0, "p95": 0, "p05": 0}
+                "p25": 0, "p75": 0, "p95": 0, "p05": 0,
+                "t_stat": None, "p_value": None}
+
     wins = df[df["R"] > 0]["R"]
     losses = df[df["R"] <= 0]["R"]
     profit_sum = wins.sum() if len(wins) > 0 else 0
     loss_sum = abs(losses.sum()) if len(losses) > 0 else 0
     pf = (profit_sum / loss_sum) if loss_sum > 0 else float("inf")
+
+    # t-test
+    t_stat, p_value = (None, None)
+    if len(df) >= 30:
+        t_stat, p_value = scipy_stats.ttest_1samp(df["R"].values, 0)
+
     return {
         "n": len(df),
         "win_rate": (df["R"] > 0).mean(),
@@ -514,16 +548,130 @@ def stats_block(df):
         "p25": df["R"].quantile(0.25),
         "p75": df["R"].quantile(0.75),
         "p95": df["R"].quantile(0.95),
+        "t_stat": t_stat,
+        "p_value": p_value,
     }
 
 
+# ══════════════════════════════════════════════════════
+#  EXECUTIVE SUMMARY
+# ══════════════════════════════════════════════════════
+def show_executive_summary(stats, n_open, n_total, universe):
+    st.subheader("📋 Executive Summary")
+
+    col1, col2, col3 = st.columns(3)
+
+    # ── ข้อ 1: มี Edge จริงไหม? ──────────────────────
+    with col1:
+        st.markdown("#### 1️⃣ มี Edge จริงไหม?")
+        if stats["n"] == 0:
+            st.error("ไม่มีข้อมูลเพียงพอ")
+        elif stats["n"] < 30:
+            st.warning(
+                f"⚠️ **สรุปไม่ได้ครับ**\n\n"
+                f"มีเพียง **{stats['n']} trades** (ต้องการอย่างน้อย 30)\n\n"
+                f"Expectancy = {stats['avg_R']:+.3f}R แต่อาจเป็นโชคล้วนๆ"
+            )
+        else:
+            avg = stats["avg_R"]
+            p = stats["p_value"]
+            p_str = f"{p:.4f}" if p is not None else "N/A"
+
+            if avg > 0 and p is not None and p < 0.05:
+                st.success(
+                    f"✅ **มี Edge จริงครับ**\n\n"
+                    f"Expectancy = **{avg:+.3f}R** ต่อ trade\n\n"
+                    f"p-value = {p_str} → มั่นใจ 95%+"
+                )
+            elif avg > 0 and p is not None and p < 0.10:
+                st.warning(
+                    f"🟡 **มี Edge แต่ยังอ่อน**\n\n"
+                    f"Expectancy = **{avg:+.3f}R** ต่อ trade\n\n"
+                    f"p-value = {p_str} → มั่นใจ ~90%"
+                )
+            elif avg > 0:
+                st.warning(
+                    f"🟡 **Avg R บวก แต่ไม่มีนัยสำคัญ**\n\n"
+                    f"Expectancy = **{avg:+.3f}R** ต่อ trade\n\n"
+                    f"p-value = {p_str} → อาจเป็นโชค"
+                )
+            else:
+                st.error(
+                    f"🔴 **ไม่มี Edge**\n\n"
+                    f"Expectancy = **{avg:+.3f}R** ต่อ trade\n\n"
+                    f"p-value = {p_str}"
+                )
+
+    # ── ข้อ 2: Edge มาจากไหน? ────────────────────────
+    with col2:
+        st.markdown("#### 2️⃣ Edge มาจากไหน?")
+        if stats["n"] == 0:
+            st.info("ไม่มีข้อมูล")
+        else:
+            avg = stats["avg_R"]
+            med = stats["median_R"]
+            diff = abs(avg - med)
+
+            if diff > 1.0 and avg > med:
+                st.warning(
+                    f"⚠️ **Edge มาจาก Outlier**\n\n"
+                    f"Avg R = {avg:+.3f}R แต่ Median = {med:+.3f}R\n\n"
+                    f"กำไรกระจุกอยู่ใน trade ดีๆ ไม่กี่ตัว — "
+                    f"ถ้า trade พวกนั้นไม่เกิดซ้ำ Edge อาจหายไป"
+                )
+            elif avg > 0 and med > 0:
+                st.success(
+                    f"✅ **Edge กระจายสม่ำเสมอ**\n\n"
+                    f"Avg R = {avg:+.3f}R | Median = {med:+.3f}R\n\n"
+                    f"ทั้งสองค่าเป็นบวก — Edge ไม่ได้พึ่ง outlier"
+                )
+            else:
+                st.error(
+                    f"🔴 **Median ติดลบ**\n\n"
+                    f"Avg R = {avg:+.3f}R | Median = {med:+.3f}R\n\n"
+                    f"trade ส่วนใหญ่ขาดทุน — กำไรรวมมาจากไม่กี่ตัว"
+                )
+
+    # ── ข้อ 3: เชื่อได้แค่ไหน? ───────────────────────
+    with col3:
+        st.markdown("#### 3️⃣ เชื่อได้แค่ไหน?")
+        issues = []
+        score = 100
+
+        if stats["n"] < 30:
+            issues.append(f"❌ Trades น้อยเกินไป ({stats['n']} < 30)")
+            score -= 40
+        elif stats["n"] < 100:
+            issues.append(f"⚠️ Trades ยังน้อย ({stats['n']} trades)")
+            score -= 15
+
+        open_pct = n_open / n_total * 100 if n_total > 0 else 0
+        if open_pct > 10:
+            issues.append(f"⚠️ Still Open {open_pct:.0f}% — ยังไม่จบจริง")
+            score -= 20
+
+        issues.append(f"⚠️ Survivorship Bias — Universe = หุ้นที่รอดแล้ว")
+        score -= 15
+
+        score = max(0, score)
+
+        if score >= 70:
+            st.success(f"✅ **เชื่อได้ระดับดี** (Score: {score}/100)\n\n" + "\n\n".join(issues))
+        elif score >= 40:
+            st.warning(f"🟡 **เชื่อได้บางส่วน** (Score: {score}/100)\n\n" + "\n\n".join(issues))
+        else:
+            st.error(f"🔴 **ควรระวัง** (Score: {score}/100)\n\n" + "\n\n".join(issues))
+
+
+# ══════════════════════════════════════════════════════
+#  DISPLAY HELPERS
+# ══════════════════════════════════════════════════════
 def show_stats_cards_main(stats):
-    """5 cards หลัก"""
     if stats["n"] == 0:
         st.info("ไม่มี trade")
         return
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Trades", f"{stats['n']:,}")
+    c1.metric("Closed Trades", f"{stats['n']:,}")
     c2.metric("Win Rate", f"{stats['win_rate']:.1%}")
     c3.metric("Expectancy (avg R)", f"{stats['avg_R']:.3f}",
               delta=f"{'+' if stats['avg_R']>0 else ''}{stats['avg_R']:.2f}")
@@ -533,99 +681,115 @@ def show_stats_cards_main(stats):
 
 
 def show_stats_cards_extra(stats):
-    """5 cards รอง"""
     if stats["n"] == 0:
         return
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Avg Win", f"{stats['avg_win']:.2f}R")
     c2.metric("Avg Loss", f"{stats['avg_loss']:.2f}R")
-    c3.metric("Max R", f"{stats['max_R']:.1f}",
-              help="trade ที่ดีที่สุด — ระวัง outlier")
-    c4.metric("Min R", f"{stats['min_R']:.1f}",
-              help="trade ที่แย่ที่สุด — ระวัง outlier")
-    c5.metric("P95 / P05", f"{stats['p95']:.1f} / {stats['p05']:.1f}",
-              help="95th และ 5th percentile (90% ของ trade อยู่ระหว่างนี้)")
+    c3.metric("Max R", f"{stats['max_R']:.1f}")
+    c4.metric("Min R", f"{stats['min_R']:.1f}")
+    c5.metric("P95 / P05", f"{stats['p95']:.1f} / {stats['p05']:.1f}")
+
+
+def show_ttest_result(stats):
+    """แสดงผล t-test แบบอ่านง่าย"""
+    if stats["n"] < 30:
+        st.warning(
+            f"⚠️ **t-test:** ต้องการ trade อย่างน้อย 30 ตัว "
+            f"— ตอนนี้มีแค่ {stats['n']} ตัว ยังสรุปไม่ได้ครับ"
+        )
+        return
+
+    t = stats["t_stat"]
+    p = stats["p_value"]
+    if t is None or p is None:
+        return
+
+    if p < 0.01:
+        st.success(
+            f"✅ **t-test: p = {p:.4f}** → มั่นใจ 99%+ ว่า Edge จริง ไม่ใช่โชค "
+            f"(t = {t:.2f}, n = {stats['n']})"
+        )
+    elif p < 0.05:
+        st.success(
+            f"✅ **t-test: p = {p:.4f}** → มั่นใจ 95%+ ว่า Edge จริง "
+            f"(t = {t:.2f}, n = {stats['n']})"
+        )
+    elif p < 0.10:
+        st.warning(
+            f"🟡 **t-test: p = {p:.4f}** → มั่นใจ ~90% — Edge อยู่แต่ยังอ่อน "
+            f"(t = {t:.2f}, n = {stats['n']})"
+        )
+    else:
+        st.error(
+            f"🔴 **t-test: p = {p:.4f}** → ไม่มีนัยสำคัญทางสถิติ "
+            f"ผลนี้อาจเกิดจากโชคล้วนๆ (t = {t:.2f}, n = {stats['n']})"
+        )
 
 
 def plot_r_distribution(df, x_min, x_max, bin_size):
-    """Histogram ของ R-Multiple พร้อม annotation outliers"""
     R = df["R"].values
-
     n_below = int((R < x_min).sum())
     n_above = int((R > x_max).sum())
     n_in_range = int(((R >= x_min) & (R <= x_max)).sum())
-
     R_in_range = R[(R >= x_min) & (R <= x_max)]
 
     fig = go.Figure()
-
     fig.add_trace(go.Histogram(
-        x=R_in_range,
-        name="Trades",
-        marker_color="#5DCAA5",
-        opacity=0.85,
+        x=R_in_range, name="Trades",
+        marker_color="#5DCAA5", opacity=0.85,
         xbins=dict(start=x_min, end=x_max, size=bin_size),
         hovertemplate="R: %{x}<br>จำนวน: %{y}<extra></extra>",
     ))
-
     fig.add_vline(x=0, line_dash="dash", line_color="gray",
                   annotation_text="Break-even", annotation_position="top")
 
     avg_R = df["R"].mean()
     median_R = df["R"].median()
-
     if x_min <= avg_R <= x_max:
         fig.add_vline(x=avg_R, line_dash="dot", line_color="#E24B4A",
-                      annotation_text=f"Avg = {avg_R:.2f}R",
-                      annotation_position="top")
+                      annotation_text=f"Avg = {avg_R:.2f}R", annotation_position="top")
     if x_min <= median_R <= x_max:
         fig.add_vline(x=median_R, line_dash="dashdot", line_color="#185FA5",
-                      annotation_text=f"Median = {median_R:.2f}R",
-                      annotation_position="bottom")
+                      annotation_text=f"Median = {median_R:.2f}R", annotation_position="bottom")
 
     annotations = []
     if n_below > 0:
         annotations.append(dict(
             x=x_min, y=1.05, xref="x", yref="paper",
             text=f"⬅ มี {n_below:,} trades ที่ R < {x_min}<br>(ต่ำสุด: {df['R'].min():.1f})",
-            showarrow=False,
-            bgcolor="rgba(226, 75, 74, 0.15)",
-            bordercolor="#E24B4A",
-            borderwidth=1,
-            font=dict(size=11, color="#A32D2D"),
-            align="left",
+            showarrow=False, bgcolor="rgba(226,75,74,0.15)",
+            bordercolor="#E24B4A", borderwidth=1,
+            font=dict(size=11, color="#A32D2D"), align="left",
         ))
     if n_above > 0:
         annotations.append(dict(
             x=x_max, y=1.05, xref="x", yref="paper",
             text=f"มี {n_above:,} trades ที่ R > {x_max} ➡<br>(สูงสุด: {df['R'].max():.1f})",
-            showarrow=False,
-            bgcolor="rgba(99, 153, 34, 0.15)",
-            bordercolor="#639922",
-            borderwidth=1,
-            font=dict(size=11, color="#3B6D11"),
-            align="right",
+            showarrow=False, bgcolor="rgba(99,153,34,0.15)",
+            bordercolor="#639922", borderwidth=1,
+            font=dict(size=11, color="#3B6D11"), align="right",
         ))
 
     fig.update_layout(
         title=dict(
-            text=f"R-Distribution (แสดง {n_in_range:,} จาก {len(df):,} trades)",
+            text=f"R-Distribution — Closed Trades (แสดง {n_in_range:,} จาก {len(df):,} trades)",
             font=dict(size=18),
         ),
-        xaxis_title="R-Multiple",
+        xaxis_title="R-Multiple (หลังหัก Fee แล้ว)",
         yaxis_title="จำนวน Trades",
-        height=480,
-        annotations=annotations,
-        margin=dict(t=100),
-        showlegend=False,
+        height=480, annotations=annotations,
+        margin=dict(t=100), showlegend=False,
     )
     return fig
 
 
 def plot_equity_curve(df):
-    """Cumulative R curve + drawdown"""
     df_sorted = df.sort_values("exit_date").copy()
     df_sorted["cum_R"] = df_sorted["R"].cumsum()
+    cum_max = df_sorted["cum_R"].cummax()
+    drawdown = df_sorted["cum_R"] - cum_max
+    max_dd = drawdown.min()
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -633,24 +797,15 @@ def plot_equity_curve(df):
         mode="lines", name="Cumulative R",
         line=dict(color="#185FA5", width=2),
     ))
-
-    cum_max = df_sorted["cum_R"].cummax()
-    drawdown = df_sorted["cum_R"] - cum_max
-    max_dd = drawdown.min()
-
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
-
     fig.update_layout(
-        title=f"Equity Curve (Cumulative R) — Final: {df_sorted['cum_R'].iloc[-1]:.1f}R, Max DD: {max_dd:.1f}R",
-        xaxis_title="Exit Date",
-        yaxis_title="Cumulative R",
-        height=400,
+        title=f"Equity Curve — Closed Trades | Final: {df_sorted['cum_R'].iloc[-1]:.1f}R | Max DD: {max_dd:.1f}R",
+        xaxis_title="Exit Date", yaxis_title="Cumulative R", height=400,
     )
     return fig
 
 
 def plot_sl_type_breakdown(df):
-    """Bar เปรียบเทียบ SL types"""
     grp = df.groupby("sl_type").agg(
         n=("R", "count"),
         avg_R=("R", "mean"),
@@ -660,7 +815,6 @@ def plot_sl_type_breakdown(df):
 
 
 def regime_comparison(df):
-    """เปรียบเทียบ stats แยกตาม regime"""
     rows = []
     for regime in ["bull", "bear", "unknown"]:
         sub = df[df["regime"] == regime]
@@ -672,13 +826,10 @@ def regime_comparison(df):
         pf_den = abs(losses.sum()) if len(losses) else 0
         pf = pf_num / pf_den if pf_den > 0 else float("inf")
         rows.append({
-            "Regime": regime,
-            "Trades": len(sub),
+            "Regime": regime, "Trades": len(sub),
             "Win Rate": (sub["R"] > 0).mean(),
-            "Avg R": sub["R"].mean(),
-            "Median R": sub["R"].median(),
-            "Profit Factor": pf,
-            "Total R": sub["R"].sum(),
+            "Avg R": sub["R"].mean(), "Median R": sub["R"].median(),
+            "Profit Factor": pf, "Total R": sub["R"].sum(),
         })
     return pd.DataFrame(rows)
 
@@ -692,28 +843,39 @@ if df.empty:
     st.info("👈 ตั้งค่าใน sidebar แล้วกด **Run Backtest** เพื่อเริ่มต้นครับ")
     st.markdown("""
     ### Logic สรุป
-    
-    **Entry**
-    - Fresh Today (Peacock เต็มวันแรก) → Buy at next Open
-    
+    **Entry** — Fresh Today (Peacock เต็มวันแรก) → Buy at next Open
+
     **Initial SL (วัน entry)**
-    - ถ้า (Close − EMA200)/EMA200 > 3% → ใช้ EMA10 cut
-    - ถ้า ≤ 3% → ใช้ EMA200 cut
-    - **Master Law (ขอบบน)**: SL ห่างจาก entry ห้ามเกิน 3%
-    - **Min Risk (ขอบล่าง)**: SL ห่างจาก entry ห้ามต่ำกว่า 1% (ป้องกัน R ระเบิด)
-    
-    **Trailing**
-    - ทุกวัน: Stop = max(SL_initial, EMA20 ของวันนั้น)
-    - EXIT เมื่อ Close < Stop → ขายที่ next Open
-    
-    **R-Multiple** = (exit − entry) / (entry − SL_initial)
+    - ใช้ Open ของ T+1 ตัดสินใจ SL (รวม overnight gap แล้ว)
+    - ถ้า (Open_T+1 − EMA200)/EMA200 > 3% → ใช้ EMA10
+    - ถ้า ≤ 3% → ใช้ EMA200
+    - **Master Law (ขอบบน):** SL ห่างจาก entry ห้ามเกิน 3%
+    - **Min Risk (ขอบล่าง):** SL ห่างจาก entry ห้ามต่ำกว่า 1%
+
+    **Trailing** — ทุกวัน: Stop = max(SL_initial, EMA20) → EXIT เมื่อ Close < Stop
+
+    **R-Multiple** = (exit − entry) / risk_unit − fee_R
     """)
 else:
-    # ── Regime Filter View Toggle ──
-    has_regime = "regime" in df.columns and df["regime"].nunique() > 1
+    # ── แยก Closed vs Still Open ──────────────────────
+    df_closed = df[df["exit_reason"] != "still_open"].copy()
+    df_open = df[df["exit_reason"] == "still_open"].copy()
+    n_open = len(df_open)
+    n_total = len(df)
 
-    df_filtered = df  # default = all trades
+    # ── Still Open Warning ────────────────────────────
+    if n_open > 0:
+        open_pct = n_open / n_total * 100
+        st.info(
+            f"📌 มี **{n_open:,} trades ยังเปิดอยู่** ({open_pct:.1f}% ของทั้งหมด) "
+            f"— R ยังไม่จบ ไม่นับในสถิติหลัก | "
+            f"R ลอยๆ เฉลี่ย = {df_open['R'].mean():+.2f}R"
+        )
 
+    # ── Regime Filter View ────────────────────────────
+    df_work = df_closed  # ใช้ closed เป็น base เสมอ
+
+    has_regime = "regime" in df_work.columns and df_work["regime"].nunique() > 1
     if has_regime:
         st.divider()
         st.subheader("🎯 Market Regime View")
@@ -722,14 +884,12 @@ else:
             ["🌐 ทั้งหมด (All)", "🟢 Bull only (Filter ON)", "🔴 Bear only", "⚖️ เทียบ Bull vs Bear"],
             horizontal=True,
         )
-
         if regime_view == "🟢 Bull only (Filter ON)":
-            df_filtered = df[df["regime"] == "bull"]
+            df_work = df_closed[df_closed["regime"] == "bull"]
         elif regime_view == "🔴 Bear only":
-            df_filtered = df[df["regime"] == "bear"]
+            df_work = df_closed[df_closed["regime"] == "bear"]
         elif regime_view == "⚖️ เทียบ Bull vs Bear":
-            df_filtered = df  # show all but display comparison
-            cmp_df = regime_comparison(df)
+            cmp_df = regime_comparison(df_closed)
             cmp_show = cmp_df.copy()
             cmp_show["Win Rate"] = cmp_show["Win Rate"].apply(lambda x: f"{x:.1%}")
             cmp_show["Avg R"] = cmp_show["Avg R"].apply(lambda x: f"{x:+.3f}")
@@ -740,7 +900,6 @@ else:
             cmp_show["Total R"] = cmp_show["Total R"].apply(lambda x: f"{x:+.1f}R")
             st.dataframe(cmp_show, use_container_width=True, hide_index=True)
 
-            # Insight
             bull = cmp_df[cmp_df["Regime"] == "bull"]
             bear = cmp_df[cmp_df["Regime"] == "bear"]
             if len(bull) > 0 and len(bear) > 0:
@@ -748,66 +907,58 @@ else:
                 bear_R = float(bear.iloc[0]["Avg R"])
                 diff = bull_R - bear_R
                 if diff > 0.1:
-                    st.success(
-                        f"✅ **สมมติฐานยืนยัน!** Bull Edge ({bull_R:+.2f}R) > Bear Edge ({bear_R:+.2f}R) "
-                        f"= ใช้ Filter ดีกว่าไม่ใช้ ({diff:+.2f}R)"
-                    )
+                    st.success(f"✅ Bull Edge ({bull_R:+.2f}R) > Bear Edge ({bear_R:+.2f}R) = Filter ได้ผล ({diff:+.2f}R)")
                 elif diff < -0.1:
-                    st.warning(
-                        f"⚠️ **ผิดคาด!** Bear Edge ({bear_R:+.2f}R) สูงกว่า Bull ({bull_R:+.2f}R) "
-                        f"— Filter ทำให้แย่ลง"
-                    )
+                    st.warning(f"⚠️ Bear Edge ({bear_R:+.2f}R) > Bull ({bull_R:+.2f}R) — Filter ทำให้แย่ลง")
                 else:
-                    st.info(
-                        f"➖ Bull vs Bear ใกล้เคียงกัน ({bull_R:+.2f}R vs {bear_R:+.2f}R) "
-                        f"— Filter ไม่ได้ช่วยเพิ่ม Edge"
-                    )
+                    st.info(f"➖ Bull vs Bear ใกล้กัน ({bull_R:+.2f}R vs {bear_R:+.2f}R) — Filter ไม่ได้ช่วยเพิ่ม Edge")
 
-        # แสดงจำนวน trade ที่กรอง
-        if regime_view != "🌐 ทั้งหมด (All)" and regime_view != "⚖️ เทียบ Bull vs Bear":
-            removed = len(df) - len(df_filtered)
-            removed_pct = removed / len(df) * 100 if len(df) > 0 else 0
-            st.caption(
-                f"แสดง {len(df_filtered):,} จาก {len(df):,} trades "
-                f"(กรองออก {removed:,} = {removed_pct:.1f}%)"
-            )
+        if regime_view not in ["🌐 ทั้งหมด (All)", "⚖️ เทียบ Bull vs Bear"]:
+            removed = len(df_closed) - len(df_work)
+            st.caption(f"แสดง {len(df_work):,} จาก {len(df_closed):,} closed trades (กรองออก {removed:,})")
 
-    # ใช้ df_filtered ในการคำนวณ stats
-    stats = stats_block(df_filtered)
+    # ── คำนวณ stats จาก Closed trades ────────────────
+    stats = stats_block(df_work)
 
+    # ══════════════════════════════════════════════════
+    #  EXECUTIVE SUMMARY (ด้านบนสุด)
+    # ══════════════════════════════════════════════════
+    st.divider()
+    show_executive_summary(stats, n_open, n_total, universe_choice)
+
+    # ══════════════════════════════════════════════════
+    #  OVERALL PERFORMANCE
+    # ══════════════════════════════════════════════════
     st.divider()
     st.subheader("📊 Overall Performance")
+    st.caption("📌 คำนวณจาก **Closed Trades เท่านั้น** — Still Open แยกออกแล้ว")
     show_stats_cards_main(stats)
     st.write("")
     show_stats_cards_extra(stats)
 
-    if stats["avg_R"] > 0:
-        if stats["avg_R"] >= 0.5:
-            st.success(f"🟢 **มี Edge ที่ดี** — Expectancy = {stats['avg_R']:.2f}R per trade")
-        elif stats["avg_R"] >= 0.2:
-            st.success(f"🟢 **มี Edge** — Expectancy = {stats['avg_R']:.2f}R per trade")
-        else:
-            st.warning(f"🟡 **Edge อ่อน** — Expectancy = {stats['avg_R']:.2f}R per trade")
-    else:
-        st.error(f"🔴 **ไม่มี Edge** — Expectancy = {stats['avg_R']:.2f}R per trade")
+    st.write("")
+    show_ttest_result(stats)
 
-    if abs(stats["avg_R"] - stats["median_R"]) > 1.0:
-        st.info(
-            f"💡 Avg R ({stats['avg_R']:.2f}) ห่างจาก Median R ({stats['median_R']:.2f}) เยอะ "
-            f"→ มี outliers ที่ดึง average ผิด — ดู Median เป็นค่าจริงมากกว่า"
-        )
+    if stats["n"] > 0:
+        if abs(stats["avg_R"] - stats["median_R"]) > 1.0:
+            st.info(
+                f"💡 Avg R ({stats['avg_R']:.2f}) ห่างจาก Median R ({stats['median_R']:.2f}) เยอะ "
+                f"→ Edge กระจุกอยู่ใน outlier ไม่กี่ตัว"
+            )
 
+    # ══════════════════════════════════════════════════
+    #  R-DISTRIBUTION
+    # ══════════════════════════════════════════════════
     st.divider()
     st.subheader("📈 R-Distribution")
 
-    # ── Preset buttons (เลือกช่วงด่วน) ──
-    st.markdown("**🎯 ช่วงสำเร็จรูป:**")
     preset_cols = st.columns(5)
     presets = [
         ("Zoom in (±3R)", -3.0, 3.0),
         ("Normal (-5 ถึง +10)", -5.0, 10.0),
         ("Wide (-10 ถึง +20)", -10.0, 20.0),
-        ("Full (Min-Max)", float(np.floor(stats["min_R"])), float(np.ceil(stats["max_R"]))),
+        ("Full (Min-Max)", float(np.floor(stats["min_R"])) if stats["n"] > 0 else -5.0,
+                           float(np.ceil(stats["max_R"])) if stats["n"] > 0 else 10.0),
         ("Custom 👇", None, None),
     ]
     for i, (label, lo, hi) in enumerate(presets):
@@ -817,130 +968,111 @@ else:
                     st.session_state["x_min_input"] = lo
                     st.session_state["x_max_input"] = hi
 
-    # ── Number inputs (กรอกเอง) ──
     col_a, col_b, col_c = st.columns([1, 1, 1])
     with col_a:
-        x_min = st.number_input(
-            "R Min (ขอบซ้าย)",
-            value=st.session_state.get("x_min_input", -5.0),
-            step=0.5,
-            format="%.1f",
-            key="x_min_input",
-            help="ค่า R ต่ำสุดที่จะแสดงในกราฟ",
-        )
+        x_min = st.number_input("R Min (ขอบซ้าย)", value=st.session_state.get("x_min_input", -5.0),
+                                step=0.5, format="%.1f", key="x_min_input")
     with col_b:
-        x_max = st.number_input(
-            "R Max (ขอบขวา)",
-            value=st.session_state.get("x_max_input", 10.0),
-            step=0.5,
-            format="%.1f",
-            key="x_max_input",
-            help="ค่า R สูงสุดที่จะแสดงในกราฟ",
-        )
+        x_max = st.number_input("R Max (ขอบขวา)", value=st.session_state.get("x_max_input", 10.0),
+                                step=0.5, format="%.1f", key="x_max_input")
     with col_c:
-        bin_size = st.selectbox(
-            "ขนาด Bin",
-            [0.25, 0.5, 1.0],
-            index=1,
-            help="bin เล็ก = ละเอียด, bin ใหญ่ = อ่านง่าย",
-        )
+        bin_size = st.selectbox("ขนาด Bin", [0.25, 0.5, 1.0], index=1)
 
-    # Validation: x_min < x_max
     if x_min >= x_max:
-        st.warning("⚠️ R Min ต้องน้อยกว่า R Max — ใช้ค่า default −5 ถึง +10")
+        st.warning("⚠️ R Min ต้องน้อยกว่า R Max — ใช้ค่า default")
         x_min, x_max = -5.0, 10.0
 
-    x_range = (x_min, x_max)
+    if not df_work.empty:
+        st.plotly_chart(plot_r_distribution(df_work, x_min, x_max, bin_size), use_container_width=True)
 
-    st.plotly_chart(
-        plot_r_distribution(df_filtered, x_range[0], x_range[1], bin_size),
-        use_container_width=True,
-    )
-
-    with st.expander("📖 อ่านกราฟ R-Distribution ยังไง?"):
-        st.markdown("""
-        - **เส้นสีเทา (Break-even)** = R = 0 → trade ที่อยู่ขวาเส้น = กำไร
-        - **เส้นแดง (Avg)** = Expectancy เฉลี่ย — ถ้าอยู่ขวา 0 = มี Edge
-        - **เส้นน้ำเงิน (Median)** = ค่ากลาง — ตัด outlier แล้ว
-        - **กล่องที่ขอบกราฟ** = บอกว่ามี trade เกินช่วงที่แสดงกี่ตัว
-        - **รูปร่างที่ดี** = right-skewed (กระจุกซ้ายแล้วลากหางยาวไปขวา) = ระบบ trend-following
-        """)
-
+    # ══════════════════════════════════════════════════
+    #  EQUITY CURVE
+    # ══════════════════════════════════════════════════
     st.divider()
     st.subheader("💰 Equity Curve")
-    st.plotly_chart(plot_equity_curve(df_filtered), use_container_width=True)
+    st.caption("📌 Closed Trades เท่านั้น")
+    if not df_work.empty:
+        st.plotly_chart(plot_equity_curve(df_work), use_container_width=True)
 
+    # ══════════════════════════════════════════════════
+    #  SL TYPE BREAKDOWN
+    # ══════════════════════════════════════════════════
     st.divider()
     st.subheader("🎯 SL Type Breakdown")
-    sl_df = plot_sl_type_breakdown(df_filtered)
-    sl_show = sl_df.copy()
-    sl_show["win_rate"] = sl_show["win_rate"].apply(lambda x: f"{x:.1%}")
-    sl_show["avg_R"] = sl_show["avg_R"].apply(lambda x: f"{x:.3f}")
-    sl_show.columns = ["SL Type", "Trades", "Avg R", "Win Rate"]
-    st.dataframe(sl_show, use_container_width=True, hide_index=True)
-    st.caption(
-        "🟢 EMA10 = ลอยสูง > 3% | 🔵 EMA200 = ใกล้ EMA200 | "
-        "🟡 +ML = ติด Master Law cap (ขอบบน) | "
-        "🟠 +MinR = ติด Min Risk floor (ขอบล่าง)"
-    )
+    if not df_work.empty:
+        sl_df = plot_sl_type_breakdown(df_work)
+        sl_show = sl_df.copy()
+        sl_show["win_rate"] = sl_show["win_rate"].apply(lambda x: f"{x:.1%}")
+        sl_show["avg_R"] = sl_show["avg_R"].apply(lambda x: f"{x:.3f}")
+        sl_show.columns = ["SL Type", "Trades", "Avg R", "Win Rate"]
+        st.dataframe(sl_show, use_container_width=True, hide_index=True)
+        st.caption("🟢 EMA10 = ลอยสูง > threshold | 🔵 EMA200 = ใกล้ EMA200 | 🟡 +ML = ติด Master Law | 🟠 +MinR = ติด Min Risk floor")
 
+    # ══════════════════════════════════════════════════
+    #  STILL OPEN SECTION
+    # ══════════════════════════════════════════════════
+    if n_open > 0:
+        st.divider()
+        with st.expander(f"📌 Still Open Trades ({n_open:,} ตัว) — R ลอยๆ ยังไม่จบ"):
+            st.caption("⚠️ trade เหล่านี้ยังไม่โดน SL — R ที่แสดงเป็นแค่ mark-to-market ณ วันสุดท้ายของข้อมูล")
+            cols_open = ["symbol", "entry_date", "days_held", "entry_price",
+                         "exit_price", "sl_initial", "risk_pct", "R_gross", "R"]
+            df_open_show = df_open[[c for c in cols_open if c in df_open.columns]].copy()
+            df_open_show["entry_date"] = pd.to_datetime(df_open_show["entry_date"]).dt.strftime("%Y-%m-%d")
+            st.dataframe(df_open_show, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════
+    #  TRADE LOG
+    # ══════════════════════════════════════════════════
     st.divider()
-    st.subheader("📋 Trade Log")
+    st.subheader("📋 Trade Log (Closed Trades)")
     fc1, fc2, fc3 = st.columns([2, 1, 1])
     with fc1:
         sym_filter = st.text_input("🔍 ค้นหา symbol", "")
     with fc2:
         sl_filter = st.selectbox(
             "SL Type",
-            ["All"] + sorted(df_filtered["sl_type"].unique().tolist()),
-            index=0,
+            ["All"] + sorted(df_work["sl_type"].unique().tolist()) if not df_work.empty else ["All"],
         )
     with fc3:
         sort_by = st.selectbox(
             "เรียงโดย",
-            ["entry_date (ล่าสุด)", "R (มากสุด)", "R (น้อยสุด)",
-             "days_held (นานสุด)", "risk_pct (สูงสุด)"],
-            index=0,
+            ["entry_date (ล่าสุด)", "R (มากสุด)", "R (น้อยสุด)", "days_held (นานสุด)"],
         )
 
-    df_show = df_filtered.copy()
+    df_show = df_work.copy()
     if sym_filter:
         df_show = df_show[df_show["symbol"].str.contains(sym_filter.upper(), na=False)]
     if sl_filter != "All":
         df_show = df_show[df_show["sl_type"] == sl_filter]
 
-    if sort_by == "entry_date (ล่าสุด)":
-        df_show = df_show.sort_values("entry_date", ascending=False)
-    elif sort_by == "R (มากสุด)":
-        df_show = df_show.sort_values("R", ascending=False)
-    elif sort_by == "R (น้อยสุด)":
-        df_show = df_show.sort_values("R", ascending=True)
-    elif sort_by == "days_held (นานสุด)":
-        df_show = df_show.sort_values("days_held", ascending=False)
-    elif sort_by == "risk_pct (สูงสุด)":
-        df_show = df_show.sort_values("risk_pct", ascending=False)
+    sort_map = {
+        "entry_date (ล่าสุด)": ("entry_date", False),
+        "R (มากสุด)": ("R", False),
+        "R (น้อยสุด)": ("R", True),
+        "days_held (นานสุด)": ("days_held", False),
+    }
+    col_s, asc_s = sort_map[sort_by]
+    df_show = df_show.sort_values(col_s, ascending=asc_s)
 
-    # คอลัมน์ที่จะแสดง (เพิ่ม regime ถ้ามี)
-    cols_base = [
-        "symbol", "entry_date", "exit_date", "days_held",
-        "entry_price", "exit_price", "sl_initial", "sl_type",
-        "risk_pct", "R", "exit_reason"
-    ]
+    cols_base = ["symbol", "entry_date", "exit_date", "days_held",
+                 "entry_price", "exit_price", "sl_initial", "sl_type",
+                 "risk_pct", "R_gross", "fee_R", "R", "exit_reason"]
     if "regime" in df_show.columns:
-        cols_base.insert(1, "regime")  # ใส่ถัดจาก symbol
+        cols_base.insert(1, "regime")
 
-    df_display = df_show[cols_base].copy()
-    df_display["entry_date"] = df_display["entry_date"].dt.strftime("%Y-%m-%d")
-    df_display["exit_date"] = df_display["exit_date"].dt.strftime("%Y-%m-%d")
+    df_display = df_show[[c for c in cols_base if c in df_show.columns]].copy()
+    df_display["entry_date"] = pd.to_datetime(df_display["entry_date"]).dt.strftime("%Y-%m-%d")
+    df_display["exit_date"] = pd.to_datetime(df_display["exit_date"]).dt.strftime("%Y-%m-%d")
 
     st.dataframe(df_display, use_container_width=True, height=400, hide_index=True)
-    st.caption(f"แสดง {len(df_display):,} จาก {len(df_filtered):,} trades")
+    st.caption(f"แสดง {len(df_display):,} จาก {len(df_work):,} closed trades")
 
     csv = df_display.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         f"💾 Download Trade Log ({len(df_display):,} trades)",
         data=csv,
-        file_name=f"peacock_backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"peacock_backtest_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
     )
 
@@ -956,22 +1088,18 @@ st.divider()
 with st.expander("ℹ️ เกี่ยวกับ Backtest"):
     st.markdown("""
     **R-Multiple** — วัดผลแต่ละ trade เป็นจำนวน "เท่าของความเสี่ยง"
-    
-    - R = -1 → Stop Loss เต็ม (เสีย 1 หน่วยความเสี่ยง)
-    - R = 0 → Break-even
-    - R = +3 → กำไร 3 เท่าของความเสี่ยง
-    
-    **Expectancy** = ค่าเฉลี่ย R ต่อ trade — ถ้า > 0 = มี Edge
-    
+    - R = -1 → Stop Loss เต็ม | R = 0 → Break-even | R = +3 → กำไร 3 เท่าของความเสี่ยง
+
+    **Expectancy** = ค่าเฉลี่ย R ต่อ trade (หลังหัก Fee) — ถ้า > 0 = มี Edge
+
     **Profit Factor** = (กำไรรวม) / (ขาดทุนรวม) — > 1.5 = ดี, > 2 = ดีมาก
-    
-    **Median R** vs **Avg R** — ถ้า Median ใกล้ 0 แต่ Avg สูงมาก = Edge มาจาก outlier ไม่กี่ตัว 
-    (ระวัง! อาจไม่ replicate ได้ในอนาคต)
-    
+
+    **t-test** — ทดสอบว่า Expectancy ที่ได้เกิดจาก Edge จริง หรือโชคล้วนๆ
+    - p < 0.05 = มั่นใจ 95%+ | p < 0.01 = มั่นใจ 99%+
+
     **ข้อจำกัด**
-    - ไม่คิด commission, slippage, spread
-    - ไม่คิด dividend
+    - Fee คิดแบบ round-trip ต่อ trade (กรอกได้ใน sidebar)
+    - Still Open trades ไม่นับในสถิติหลัก
+    - Survivorship Bias: Universe ปัจจุบันไม่สะท้อนความจริงในอดีต
     - ทุก trade = 1R เท่ากัน (ไม่มี compounding)
-    - Survivorship bias: S&P500 / SET100 ปัจจุบัน ไม่สะท้อนความจริงในอดีต
-    - Trade ที่ยังเปิดอยู่ตอนจบข้อมูล (exit_reason = `still_open`) อาจมี R สูงผิดปกติ
     """)
